@@ -8,11 +8,13 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#if !defined(__APPLE__)
 #include <malloc.h>
+#endif
 
 #ifdef _WIN32
 #include <direct.h>
-#elif defined (__unix__)
+#elif defined (__unix__) || defined(__APPLE__)
 #include <sys/stat.h>
 #define _mkdir(str)				mkdir(str, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH)
 #endif
@@ -200,15 +202,30 @@ int PsyX_CD_CheckImageAvailable()
 	return 0;
 }
 
+/* Read one directory sector into `sector` and return its data size from the
+ * "." entry (first record, nameLength==1, name[0]==0).  ISO 9660 guarantees
+ * the "." entry is always first, so we can read the total directory size on
+ * the very first sector of any directory.                                    */
+static int _readDirSector(VFILE* img, int lba, int sectorSize, Sector* sector)
+{
+	vfseek(img, lba * sectorSize, SEEK_SET);
+	vfread(sector, sizeof(Sector), 1, img);
+	/* "." entry is first: its fileSize gives the whole directory's byte count */
+	TOC* dot = (TOC*)&sector->data[0];
+	return (int)dot->fileSize[0];
+}
+
 CdlFILE* CdSearchFile(CdlFILE* fp, char* name)
 {
 	char pathPart[16];
 	int tocLocalOffset;
 	TOC* toc;
 	int pathOfs;
-	int dirLevel;
 
 	Sector sector;
+	int dirLBA;          /* LBA of the directory currently being searched */
+	int dirTotalSectors; /* how many 2048-byte sectors the directory spans */
+	int dirSectorIdx;    /* how many sectors we have already consumed      */
 
 	memset(fp, 0, sizeof(CdlFILE));
 
@@ -217,7 +234,6 @@ CdlFILE* CdSearchFile(CdlFILE* fp, char* name)
 
 	if (!g_cdReadDoneFlag)
 	{
-		// deny request
 		eprintwarn("CdSearchFile called while in 'CdlReadS'\n");
 		return NULL;
 	}
@@ -225,58 +241,73 @@ CdlFILE* CdSearchFile(CdlFILE* fp, char* name)
 #ifdef _DEBUG
 	eprintf("CdSearchFile: %s\n", name);
 #endif
-	
-	dirLevel = 0;
-	
-	// go to sector 22
-	vfseek(&g_imageFile, CD_ROOT_DIRECTORY_SECTOR * g_cdSectorSize, SEEK_SET);
-	vfread(&sector, sizeof(Sector), 1, &g_imageFile);
-	
-	toc = (TOC*)&sector.data[0];
-	tocLocalOffset = 0;
 
 	if (name[0] == '\\')
 		name++;
 
 	pathOfs = GetCurrentDirName(pathPart, name);
 
-	while (toc->tocEntryLength != 0)
+	/* Start at the root directory */
+	dirLBA = CD_ROOT_DIRECTORY_SECTOR;
 	{
+		int dirBytes = _readDirSector(&g_imageFile, dirLBA, g_cdSectorSize, &sector);
+		dirTotalSectors = (dirBytes + 2047) / 2048;
+	}
+	dirSectorIdx = 1;
+	toc = (TOC*)&sector.data[0];
+	tocLocalOffset = 0;
+
+	for (;;)
+	{
+		/* End of data in this sector — zero padding before next sector */
+		if (toc->tocEntryLength == 0)
+		{
+			if (dirSectorIdx >= dirTotalSectors)
+				break; /* no more sectors in this directory */
+			/* Advance to next consecutive sector of this directory */
+			dirLBA++;
+			dirSectorIdx++;
+			vfseek(&g_imageFile, dirLBA * g_cdSectorSize, SEEK_SET);
+			vfread(&sector, sizeof(Sector), 1, &g_imageFile);
+			tocLocalOffset = 0;
+			toc = (TOC*)&sector.data[0];
+			continue;
+		}
+
 		char* itemNameStr = (char*)&sector.data[tocLocalOffset + sizeof(TOC)];
 
-		// skip . and .. for now
+		/* skip . and .. */
 		if (*itemNameStr == 0 || *itemNameStr == 1)
 		{
 			tocLocalOffset += toc->tocEntryLength;
 			toc = (TOC*)&sector.data[tocLocalOffset];
-			
 			continue;
 		}
-		
+
 		if (!strcmp(itemNameStr, pathPart))
 		{
-			if(toc->flags & 2) // is directory
+			if (toc->flags & 2) /* is directory — descend */
 			{
-				// get next directory name
 				pathOfs += GetCurrentDirName(pathPart, name + pathOfs + 1) + 1;
 
-				// read the needed sector with directory contents
-				dirLevel++;
-				vfseek(&g_imageFile, toc->sectorPosition[0] * g_cdSectorSize, SEEK_SET);
-				vfread(&sector, sizeof(Sector), 1, &g_imageFile);
-
-				tocLocalOffset = 0;;
-				toc = (TOC*)&sector.data[tocLocalOffset];
+				dirLBA = (int)toc->sectorPosition[0];
+				{
+					int dirBytes = _readDirSector(&g_imageFile, dirLBA, g_cdSectorSize, &sector);
+					dirTotalSectors = (dirBytes + 2047) / 2048;
+				}
+				dirSectorIdx = 1;
+				tocLocalOffset = 0;
+				toc = (TOC*)&sector.data[0];
 				continue;
 			}
-			
+
+			/* Found the file */
 			memcpy(fp->name, itemNameStr, toc->nameLength);
-			
 			fp->size = toc->fileSize[0];
-			
+
 			vfseek(&g_imageFile, toc->sectorPosition[0] * g_cdSectorSize, SEEK_SET);
 			vfread(&sector, sizeof(Sector), 1, &g_imageFile);
-			
+
 			fp->pos.minute = sector.addr[0];
 			fp->pos.second = sector.addr[1];
 			fp->pos.sector = sector.addr[2];
@@ -582,7 +613,7 @@ int CdSync(int mode, u_char * result)
 			if (readMode == RM_XA_AUDIO)
 			{
 				char xaAudioData[2336];
-				CdRead(1, (u_long*)&xaAudioData[0], CdlReadS);
+				CdRead(1, (unsigned int*)&xaAudioData[0], CdlReadS);
 				CdReadSync(CdlReadS, NULL);
 
 				//Sector should be read now
